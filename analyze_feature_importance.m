@@ -293,7 +293,7 @@ if ismember('randomforest', methodsToUse)
             fprintf('Random Forest importance computed.\n');
         end
     catch ME
-        warning('Random Forest failed: %s', ME.message);
+        warning(ME.identifier, 'Random Forest failed: %s', ME.message);
         scores(:, methodIdx) = NaN;
         modelAccuracy = NaN;
     end
@@ -311,11 +311,12 @@ if ismember('relief', methodsToUse)
     end
     
     try
-        if strcmp(problemType, 'classification')
+        % relieff automatically handles classification and regression
+        % if strcmp(problemType, 'classification')
             [reliefScores, ~] = relieff(X, y, 10);
-        else
-            [reliefScores, ~] = relieff(X, y, 10);
-        end
+        % else
+            % [reliefScores, ~] = relieff(X, y, 10);
+        % end
         
         scores(:, methodIdx) = reliefScores;
         
@@ -323,7 +324,7 @@ if ismember('relief', methodsToUse)
             fprintf('ReliefF importance computed.\n');
         end
     catch ME
-        warning('ReliefF failed: %s', ME.message);
+        warning(ME.identifier, 'ReliefF failed: %s', ME.message);
         scores(:, methodIdx) = NaN;
     end
 end
@@ -350,7 +351,7 @@ if ismember('correlation', methodsToUse)
             fprintf('Correlation coefficients computed.\n');
         end
     catch ME
-        warning('Correlation analysis failed: %s', ME.message);
+        warning(ME.identifier, 'Correlation analysis failed: %s', ME.message);
         scores(:, methodIdx) = NaN;
     end
 end
@@ -386,7 +387,7 @@ if ismember('mutualinfo', methodsToUse)
             fprintf('Mutual information computed.\n');
         end
     catch ME
-        warning('Mutual Information failed: %s', ME.message);
+        warning(ME.identifier, 'Mutual Information failed: %s', ME.message);
         scores(:, methodIdx) = NaN;
     end
 end
