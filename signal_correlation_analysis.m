@@ -6,13 +6,16 @@ function signal_correlation_analysis()
 %
 %  Features:
 %  - Flexible nested struct support (automatically flattens hierarchical data)
+%  - Comprehensive data validation (time, response, powerOn, external signals)
+%  - Automatic data cleaning (row->column conversion, NaN handling, dimension fixes)
+%  - Robust error handling (graceful degradation if analysis methods fail)
 %  - Advanced dynamic feature extraction (time constants, damping, etc.)
 %  - Dynamic analysis windows (prevents event overlap)
 %  - Robust feature extraction (non-zero settling, final slope)
 %  - Fit-quality metrics (R-squared as a feature)
 %  - Multiple statistical methods (Correlation, Random Forest, MI, Granger)
 %  - Robust statistical testing with multiple comparison correction
-%  - Automatic signal validation and error handling
+%  - Informative error messages with suggestions for fixing data issues
 %
 %  Author: KK
 %  Date: 2025
@@ -52,6 +55,20 @@ fprintf('========================================\n\n');
 
 data = generateSyntheticData(); % REMOVE THIS LINE for real data
 
+% ---------------------- VALIDATE CORE DATA FIELDS ----------------------
+fprintf('Validating core data fields...\n');
+[data, validationReport] = validateAndCleanData(data);
+fprintf('  %s\n', validationReport.summary);
+
+if validationReport.hasCriticalErrors
+    error('Critical data validation errors found. Please fix the data and try again.');
+end
+
+if validationReport.hasWarnings
+    fprintf('  Note: %d warnings were issued during validation\n', validationReport.warningCount);
+end
+fprintf('\n');
+
 % ---------------------- FLATTEN NESTED STRUCTS ----------------------
 % Automatically handle nested structures in data.external
 if isfield(data, 'external') && isstruct(data.external)
@@ -80,25 +97,80 @@ if isfield(data, 'external') && isstruct(data.external)
         fprintf('  External signals already in flat structure\n');
     end
 
-    % Validate that all signals have the correct length
-    fprintf('  Validating signal lengths...\n');
+    % Validate and clean external signals
+    fprintf('  Validating and cleaning external signals...\n');
     expectedLength = length(data.time);
     externalFields = fieldnames(data.external);
     invalidSignals = {};
+    fixedSignals = {};
+    signalsWithNaN = {};
 
     for i = 1:length(externalFields)
         signalName = externalFields{i};
         signal = data.external.(signalName);
 
-        % Check if signal is a vector and has correct length
+        % Check if numeric or logical
+        if ~isnumeric(signal) && ~islogical(signal)
+            warning('Signal "%s" is %s (not numeric/logical) - will be skipped', ...
+                    signalName, class(signal));
+            invalidSignals{end+1} = signalName;
+            continue;
+        end
+
+        % Auto-fix: Convert row vector to column vector
+        if isrow(signal) && length(signal) > 1
+            signal = signal(:);
+            data.external.(signalName) = signal;
+            fixedSignals{end+1} = sprintf('%s (row->col)', signalName);
+        end
+
+        % Check if signal is a vector
         if ~isvector(signal)
             warning('Signal "%s" is not a vector (size: %s) - will be skipped', ...
                     signalName, mat2str(size(signal)));
             invalidSignals{end+1} = signalName;
-        elseif length(signal) ~= expectedLength
+            continue;
+        end
+
+        % Check length
+        if length(signal) ~= expectedLength
             warning('Signal "%s" has incorrect length %d (expected %d) - will be skipped', ...
                     signalName, length(signal), expectedLength);
             invalidSignals{end+1} = signalName;
+            continue;
+        end
+
+        % Check for Inf values (critical error for signal)
+        infCount = sum(isinf(signal));
+        if infCount > 0
+            warning('Signal "%s" contains %d Inf values - will be skipped', ...
+                    signalName, infCount);
+            invalidSignals{end+1} = signalName;
+            continue;
+        end
+
+        % Check for NaN values (warning, but keep signal)
+        nanCount = sum(isnan(signal));
+        if nanCount > 0
+            nanPct = 100 * nanCount / expectedLength;
+            if nanPct > 50
+                warning('Signal "%s" contains %.1f%% NaN values (too many) - will be skipped', ...
+                        signalName, nanPct);
+                invalidSignals{end+1} = signalName;
+                continue;
+            elseif nanPct > 10
+                warning('Signal "%s" contains %.1f%% NaN values - may reduce analysis quality', ...
+                        signalName, nanPct);
+                signalsWithNaN{end+1} = signalName;
+            else
+                signalsWithNaN{end+1} = signalName;
+            end
+        end
+
+        % Check for constant signal (zero variance)
+        if var(signal, 'omitnan') == 0
+            warning('Signal "%s" is constant (zero variance) - may not be useful for analysis', ...
+                    signalName);
         end
     end
 
@@ -107,8 +179,16 @@ if isfield(data, 'external') && isstruct(data.external)
         data.external = rmfield(data.external, invalidSignals{i});
     end
 
+    % Report results
+    if ~isempty(fixedSignals)
+        fprintf('  Auto-fixed %d signal(s): %s\n', length(fixedSignals), strjoin(fixedSignals, ', '));
+    end
     if ~isempty(invalidSignals)
-        fprintf('  Removed %d invalid signals\n', length(invalidSignals));
+        fprintf('  Removed %d invalid signal(s)\n', length(invalidSignals));
+    end
+    if ~isempty(signalsWithNaN)
+        fprintf('  Note: %d signal(s) contain NaN values (will be handled during analysis)\n', ...
+                length(signalsWithNaN));
     end
 
     finalSignalCount = length(fieldnames(data.external));
@@ -785,6 +865,9 @@ fprintf('  Correlation analysis complete\n\n');
 fprintf('Step 7: Performing Random Forest analysis...\n');
 
 rfResults = struct();
+rfAnalysisSuccess = false;
+
+try
 
 % Prepare feature matrix
 X_external = zeros(numEvents, length(externalFeatureNames));
@@ -859,7 +942,13 @@ for m = 1:length(responseMetricsToAnalyze)
     end
 end
 
-fprintf('  Random Forest analysis complete\n\n');
+    rfAnalysisSuccess = true;
+    fprintf('  Random Forest analysis complete\n\n');
+
+catch ME
+    warning('Random Forest analysis failed: %s', ME.message);
+    fprintf('  Random Forest analysis skipped due to error\n\n');
+end
 
 %% ========================================================================
 %  SECTION 9: METHOD 3 - MUTUAL INFORMATION
@@ -868,6 +957,9 @@ fprintf('  Random Forest analysis complete\n\n');
 fprintf('Step 8: Computing Mutual Information...\n');
 
 miResults = struct();
+miAnalysisSuccess = false;
+
+try
 
 % The new metrics from responseMetricsToAnalyze will be included here
 for m = 1:length(responseMetricsToAnalyze)
@@ -915,7 +1007,13 @@ for m = 1:length(responseMetricsToAnalyze)
     miResults.(metricName).sortedIndices = sortIdx;
 end
 
-fprintf('  Mutual Information analysis complete\n\n');
+    miAnalysisSuccess = true;
+    fprintf('  Mutual Information analysis complete\n\n');
+
+catch ME
+    warning('Mutual Information analysis failed: %s', ME.message);
+    fprintf('  Mutual Information analysis skipped due to error\n\n');
+end
 
 %% ========================================================================
 %  SECTION 10: METHOD 4 - PARTIAL CORRELATION
@@ -924,6 +1022,9 @@ fprintf('  Mutual Information analysis complete\n\n');
 fprintf('Step 9: Computing Partial Correlations...\n');
 
 partialCorrResults = struct();
+partialCorrAnalysisSuccess = false;
+
+try
 
 % The new metrics from responseMetricsToAnalyze will be included here
 for m = 1:length(responseMetricsToAnalyze)
@@ -986,7 +1087,13 @@ for m = 1:length(responseMetricsToAnalyze)
     partialCorrResults.(metricName).sortedIndices = sortIdx;
 end
 
-fprintf('  Partial correlation analysis complete\n\n');
+    partialCorrAnalysisSuccess = true;
+    fprintf('  Partial correlation analysis complete\n\n');
+
+catch ME
+    warning('Partial correlation analysis failed: %s', ME.message);
+    fprintf('  Partial correlation analysis skipped due to error\n\n');
+end
 
 %% ========================================================================
 %  SECTION 11: METHOD 5 - GRANGER CAUSALITY (Temporal Precedence)
@@ -995,6 +1102,9 @@ fprintf('  Partial correlation analysis complete\n\n');
 fprintf('Step 10: Testing Granger Causality...\n');
 
 grangerResults = struct();
+grangerAnalysisSuccess = false;
+
+try
 
 % For each external signal, test if it Granger-causes the response
 % This requires time-series analysis on the raw signals
@@ -1029,10 +1139,16 @@ for j = 1:numExternal
     end
 end
 
-if ~isempty(fieldnames(grangerResults))
-    fprintf('  Granger causality tests complete\n\n');
-else
-    fprintf('  Granger causality tests skipped (insufficient data)\n\n');
+    if ~isempty(fieldnames(grangerResults))
+        grangerAnalysisSuccess = true;
+        fprintf('  Granger causality tests complete\n\n');
+    else
+        fprintf('  Granger causality tests skipped (insufficient data)\n\n');
+    end
+
+catch ME
+    warning('Granger causality analysis failed: %s', ME.message);
+    fprintf('  Granger causality tests skipped due to error\n\n');
 end
 
 %% ========================================================================
@@ -1052,19 +1168,23 @@ for m = 1:length(responseMetricsToAnalyze)
         continue; % Skip if no data was generated
     end
     
-    % Initialize ranks matrix
+    % Initialize ranks matrix with dynamic size based on available methods
     numFeatures = length(externalFeatureNames);
-    ranksMatrix = nan(numFeatures, 4); % 4 methods: Pearson, RF, MI, Partial
-    
-    % Pearson correlation ranks
+    methodCount = 0;
+    maxMethods = 4; % Pearson, RF, MI, Partial
+    ranksMatrix = nan(numFeatures, maxMethods);
+
+    % Pearson correlation ranks (always available)
+    methodCount = methodCount + 1;
     if isfield(correlationResults, metricName) && isfield(correlationResults.(metricName), 'Pearson')
         absCorr = abs(correlationResults.(metricName).Pearson.correlations);
         [~, ~, ranks] = unique(absCorr);
-        ranksMatrix(:, 1) = max(ranks) - ranks + 1; % Reverse so 1 is best
+        ranksMatrix(:, methodCount) = max(ranks) - ranks + 1; % Reverse so 1 is best
     end
-    
-    % Random Forest importance ranks
-    if isfield(rfResults, metricName)
+
+    % Random Forest importance ranks (only if succeeded)
+    if rfAnalysisSuccess && isfield(rfResults, metricName)
+        methodCount = methodCount + 1;
         importance = nan(numFeatures, 1);
         featureNamesRF = rfResults.(metricName).featureNames;
         for f = 1:length(featureNamesRF)
@@ -1074,18 +1194,20 @@ for m = 1:length(responseMetricsToAnalyze)
             end
         end
         [~, ~, ranks] = unique(importance);
-        ranksMatrix(:, 2) = max(ranks) - ranks + 1;
+        ranksMatrix(:, methodCount) = max(ranks) - ranks + 1;
     end
-    
-    % Mutual Information ranks
-    if isfield(miResults, metricName)
+
+    % Mutual Information ranks (only if succeeded)
+    if miAnalysisSuccess && isfield(miResults, metricName)
+        methodCount = methodCount + 1;
         miScores = miResults.(metricName).scores;
         [~, ~, ranks] = unique(miScores);
-        ranksMatrix(:, 3) = max(ranks) - ranks + 1;
+        ranksMatrix(:, methodCount) = max(ranks) - ranks + 1;
     end
-    
-    % Partial correlation ranks
-    if isfield(partialCorrResults, metricName)
+
+    % Partial correlation ranks (only if succeeded)
+    if partialCorrAnalysisSuccess && isfield(partialCorrResults, metricName)
+        methodCount = methodCount + 1;
         partialCorr = nan(numFeatures, 1);
         featureNamesPC = partialCorrResults.(metricName).featureNames;
         for f = 1:length(featureNamesPC)
@@ -1095,10 +1217,11 @@ for m = 1:length(responseMetricsToAnalyze)
             end
         end
         [~, ~, ranks] = unique(partialCorr);
-        ranksMatrix(:, 4) = max(ranks) - ranks + 1;
+        ranksMatrix(:, methodCount) = max(ranks) - ranks + 1;
     end
-    
-    % Average ranks (ignoring NaNs from failed methods)
+
+    % Trim unused columns and average ranks (ignoring NaNs from failed methods)
+    ranksMatrix = ranksMatrix(:, 1:methodCount);
     avgRank = mean(ranksMatrix, 2, 'omitnan');
     [~, sortIdx] = sort(avgRank, 'asc'); % 'asc' because 1 is best rank
     
@@ -1486,6 +1609,31 @@ fprintf('========================================\n');
 fprintf('ANALYSIS COMPLETE!\n');
 fprintf('========================================\n\n');
 
+fprintf('Analysis Methods Summary:\n');
+fprintf('------------------------\n');
+fprintf('  Correlation Analysis:     Success\n');
+if rfAnalysisSuccess
+    fprintf('  Random Forest:            Success\n');
+else
+    fprintf('  Random Forest:            Failed/Skipped\n');
+end
+if miAnalysisSuccess
+    fprintf('  Mutual Information:       Success\n');
+else
+    fprintf('  Mutual Information:       Failed/Skipped\n');
+end
+if partialCorrAnalysisSuccess
+    fprintf('  Partial Correlation:      Success\n');
+else
+    fprintf('  Partial Correlation:      Failed/Skipped\n');
+end
+if grangerAnalysisSuccess
+    fprintf('  Granger Causality:        Success\n');
+else
+    fprintf('  Granger Causality:        Failed/Skipped\n');
+end
+fprintf('\n');
+
 fprintf('Key Findings Summary:\n');
 fprintf('--------------------\n');
 if isfield(consensusRanking, 'valueAtPowerOn')
@@ -1726,6 +1874,209 @@ end % --- THIS ENDS THE MAIN FUNCTION ---
         % Restore NaNs
         adj_p(nanPvals) = NaN;
         h(nanPvals) = NaN;
+    end
+
+    function [data, report] = validateAndCleanData(data)
+        % Comprehensive validation and automatic cleaning of input data
+        %
+        % Validates and cleans:
+        %   - data.time: monotonic, no NaN/Inf, proper dimensions
+        %   - data.response: correct length, NaN/Inf handling
+        %   - data.powerOn: correct length, logical type
+        %   - data.external: existence check
+        %
+        % Returns:
+        %   data - Cleaned data structure
+        %   report - Validation report with warnings and errors
+
+        report = struct();
+        report.hasCriticalErrors = false;
+        report.hasWarnings = false;
+        report.warningCount = 0;
+        report.messages = {};
+
+        function addWarning(msg)
+            report.hasWarnings = true;
+            report.warningCount = report.warningCount + 1;
+            report.messages{end+1} = sprintf('WARNING: %s', msg);
+            warning(msg);
+        end
+
+        function addError(msg)
+            report.hasCriticalErrors = true;
+            report.messages{end+1} = sprintf('ERROR: %s', msg);
+            fprintf(2, 'ERROR: %s\n', msg);
+        end
+
+        % Check if data is a struct
+        if ~isstruct(data)
+            addError('Input "data" must be a struct');
+            report.summary = 'Validation failed: input must be a struct';
+            return;
+        end
+
+        %% Validate TIME vector
+        if ~isfield(data, 'time')
+            addError('Missing required field: data.time');
+        else
+            % Check if numeric
+            if ~isnumeric(data.time)
+                addError('data.time must be numeric');
+            else
+                % Convert row vector to column vector
+                if isrow(data.time)
+                    data.time = data.time(:);
+                    addWarning('data.time was a row vector - converted to column vector');
+                end
+
+                % Check dimensions
+                if ~isvector(data.time)
+                    addError(sprintf('data.time must be a vector, got size [%s]', num2str(size(data.time))));
+                elseif length(data.time) < 100
+                    addWarning(sprintf('data.time is very short (%d samples) - results may be unreliable', length(data.time)));
+                end
+
+                % Check for NaN/Inf
+                if any(~isfinite(data.time))
+                    addError('data.time contains NaN or Inf values');
+                end
+
+                % Check monotonicity
+                if length(data.time) > 1 && any(diff(data.time) <= 0)
+                    addError('data.time must be strictly monotonically increasing');
+                end
+
+                % Check for reasonable sample rate
+                if length(data.time) > 1
+                    dt = median(diff(data.time));
+                    if dt <= 0
+                        addError('data.time has non-positive time steps');
+                    elseif dt > 60
+                        addWarning(sprintf('data.time has large time steps (%.1f sec) - may need different analysis parameters', dt));
+                    end
+                end
+            end
+        end
+
+        if report.hasCriticalErrors
+            report.summary = 'Validation failed with critical errors in data.time';
+            return;
+        end
+
+        n = length(data.time);
+
+        %% Validate RESPONSE signal
+        if ~isfield(data, 'response')
+            addError('Missing required field: data.response');
+        else
+            % Check if numeric
+            if ~isnumeric(data.response)
+                addError('data.response must be numeric');
+            else
+                % Convert row vector to column vector
+                if isrow(data.response)
+                    data.response = data.response(:);
+                    addWarning('data.response was a row vector - converted to column vector');
+                end
+
+                % Check dimensions
+                if ~isvector(data.response)
+                    addError(sprintf('data.response must be a vector, got size [%s]', num2str(size(data.response))));
+                elseif length(data.response) ~= n
+                    addError(sprintf('data.response length (%d) does not match data.time length (%d)', ...
+                             length(data.response), n));
+                end
+
+                % Check for NaN/Inf and handle
+                nanCount = sum(isnan(data.response));
+                infCount = sum(isinf(data.response));
+
+                if infCount > 0
+                    addError(sprintf('data.response contains %d Inf values - cannot proceed', infCount));
+                elseif nanCount > 0
+                    nanPct = 100 * nanCount / n;
+                    if nanPct > 50
+                        addError(sprintf('data.response contains %.1f%% NaN values (too many)', nanPct));
+                    elseif nanPct > 10
+                        addWarning(sprintf('data.response contains %.1f%% NaN values - may affect analysis quality', nanPct));
+                    else
+                        addWarning(sprintf('data.response contains %d NaN values', nanCount));
+                    end
+                end
+
+                % Check for constant signal
+                if length(data.response) > 1 && var(data.response, 'omitnan') == 0
+                    addError('data.response is constant (zero variance) - cannot analyze');
+                end
+            end
+        end
+
+        %% Validate POWER-ON signal
+        if ~isfield(data, 'powerOn')
+            addError('Missing required field: data.powerOn');
+        else
+            % Convert row vector to column vector
+            if isrow(data.powerOn)
+                data.powerOn = data.powerOn(:);
+                addWarning('data.powerOn was a row vector - converted to column vector');
+            end
+
+            % Check dimensions
+            if ~isvector(data.powerOn)
+                addError(sprintf('data.powerOn must be a vector, got size [%s]', num2str(size(data.powerOn))));
+            elseif length(data.powerOn) ~= n
+                addError(sprintf('data.powerOn length (%d) does not match data.time length (%d)', ...
+                         length(data.powerOn), n));
+            end
+
+            % Convert to logical if numeric
+            if isnumeric(data.powerOn)
+                uniqueVals = unique(data.powerOn);
+                if all(ismember(uniqueVals, [0, 1])) || all(ismember(uniqueVals, [0, 1, NaN]))
+                    data.powerOn = logical(data.powerOn);
+                    addWarning('data.powerOn was numeric - converted to logical');
+                else
+                    addError(sprintf('data.powerOn contains values other than 0/1: [%s]', ...
+                             num2str(uniqueVals(:)')));
+                end
+            elseif ~islogical(data.powerOn)
+                addError(sprintf('data.powerOn must be logical or numeric, got %s', class(data.powerOn)));
+            end
+
+            % Check for NaN
+            if any(isnan(data.powerOn))
+                nanCount = sum(isnan(data.powerOn));
+                addWarning(sprintf('data.powerOn contains %d NaN values - treating as false (off)', nanCount));
+                data.powerOn(isnan(data.powerOn)) = false;
+            end
+
+            % Check if there are any power-on events
+            if all(~data.powerOn)
+                addError('data.powerOn is always false - no power-on events to analyze');
+            elseif all(data.powerOn)
+                addWarning('data.powerOn is always true - no power-on events to detect');
+            end
+        end
+
+        %% Validate EXTERNAL signals field
+        if ~isfield(data, 'external')
+            addError('Missing required field: data.external');
+        elseif ~isstruct(data.external)
+            addError('data.external must be a struct');
+        elseif isempty(fieldnames(data.external))
+            addError('data.external is an empty struct - no signals to analyze');
+        end
+
+        %% Generate summary
+        if report.hasCriticalErrors
+            report.summary = sprintf('Validation failed with %d critical error(s)', ...
+                                   sum(contains(report.messages, 'ERROR')));
+        elseif report.hasWarnings
+            report.summary = sprintf('Validation passed with %d warning(s)', report.warningCount);
+        else
+            report.summary = sprintf('All validation checks passed (%d samples, %.1f sec duration)', ...
+                                   n, data.time(end) - data.time(1));
+        end
     end
 
     function flatStruct = flattenNestedStruct(nestedStruct, prefix)
