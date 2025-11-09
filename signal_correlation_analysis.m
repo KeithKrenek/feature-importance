@@ -5,12 +5,14 @@ function signal_correlation_analysis()
 %  ========================================================================
 %
 %  Features:
+%  - Flexible nested struct support (automatically flattens hierarchical data)
 %  - Advanced dynamic feature extraction (time constants, damping, etc.)
 %  - Dynamic analysis windows (prevents event overlap)
 %  - Robust feature extraction (non-zero settling, final slope)
 %  - Fit-quality metrics (R-squared as a feature)
 %  - Multiple statistical methods (Correlation, Random Forest, MI, Granger)
 %  - Robust statistical testing with multiple comparison correction
+%  - Automatic signal validation and error handling
 %
 %  Author: KK
 %  Date: 2025
@@ -35,8 +37,89 @@ fprintf('========================================\n\n');
 %   data.response     - Response signal [N x 1]
 %   data.powerOn      - Boolean power status [N x 1]
 %   data.external     - Struct with external signals
+%
+% FLEXIBILITY: data.external can be either:
+%   1. Flat structure:    data.external.signal1 = [N x 1]
+%                         data.external.signal2 = [N x 1]
+%   2. Nested structure:  data.external.sensors.temp = [N x 1]
+%                         data.external.sensors.pressure = [N x 1]
+%                         data.external.actuators.voltage = [N x 1]
+%
+% Nested structs will be automatically flattened with underscore-separated names:
+%   sensors.temp -> sensors_temp
+%   sensors.pressure -> sensors_pressure
+%   actuators.voltage -> actuators_voltage
 
 data = generateSyntheticData(); % REMOVE THIS LINE for real data
+
+% ---------------------- FLATTEN NESTED STRUCTS ----------------------
+% Automatically handle nested structures in data.external
+if isfield(data, 'external') && isstruct(data.external)
+    fprintf('Processing external signals...\n');
+
+    % Check if there are any nested structs
+    externalFields = fieldnames(data.external);
+    hasNestedStructs = false;
+    for i = 1:length(externalFields)
+        if isstruct(data.external.(externalFields{i}))
+            hasNestedStructs = true;
+            break;
+        end
+    end
+
+    % Flatten if nested structs are detected
+    if hasNestedStructs
+        fprintf('  Detected nested structures - flattening...\n');
+        originalExternal = data.external;
+        data.external = flattenNestedStruct(originalExternal);
+
+        flatFields = fieldnames(data.external);
+        fprintf('  Flattened %d nested fields into %d signals\n', ...
+                length(externalFields), length(flatFields));
+    else
+        fprintf('  External signals already in flat structure\n');
+    end
+
+    % Validate that all signals have the correct length
+    fprintf('  Validating signal lengths...\n');
+    expectedLength = length(data.time);
+    externalFields = fieldnames(data.external);
+    invalidSignals = {};
+
+    for i = 1:length(externalFields)
+        signalName = externalFields{i};
+        signal = data.external.(signalName);
+
+        % Check if signal is a vector and has correct length
+        if ~isvector(signal)
+            warning('Signal "%s" is not a vector (size: %s) - will be skipped', ...
+                    signalName, mat2str(size(signal)));
+            invalidSignals{end+1} = signalName;
+        elseif length(signal) ~= expectedLength
+            warning('Signal "%s" has incorrect length %d (expected %d) - will be skipped', ...
+                    signalName, length(signal), expectedLength);
+            invalidSignals{end+1} = signalName;
+        end
+    end
+
+    % Remove invalid signals
+    for i = 1:length(invalidSignals)
+        data.external = rmfield(data.external, invalidSignals{i});
+    end
+
+    if ~isempty(invalidSignals)
+        fprintf('  Removed %d invalid signals\n', length(invalidSignals));
+    end
+
+    finalSignalCount = length(fieldnames(data.external));
+    fprintf('  Validated %d external signals successfully\n', finalSignalCount);
+
+    if finalSignalCount == 0
+        error('No valid external signals found after validation');
+    end
+else
+    error('data.external field is missing or not a struct');
+end
 
 % ---------------------- ANALYSIS PARAMETERS ----------------------
 params = struct();
@@ -1645,6 +1728,72 @@ end % --- THIS ENDS THE MAIN FUNCTION ---
         h(nanPvals) = NaN;
     end
 
+    function flatStruct = flattenNestedStruct(nestedStruct, prefix)
+        % Recursively flatten a nested struct into a flat struct with signal arrays
+        %
+        % Inputs:
+        %   nestedStruct - Potentially nested struct containing signal data
+        %   prefix       - String prefix for field names (default: '')
+        %
+        % Output:
+        %   flatStruct   - Flat struct where all fields are numeric arrays
+        %
+        % Example:
+        %   Input:  data.sensors.temperature = [1 2 3]
+        %           data.sensors.pressure = [4 5 6]
+        %           data.voltage = [7 8 9]
+        %   Output: flat.sensors_temperature = [1 2 3]
+        %           flat.sensors_pressure = [4 5 6]
+        %           flat.voltage = [7 8 9]
+
+        if nargin < 2
+            prefix = '';
+        end
+
+        flatStruct = struct();
+
+        if ~isstruct(nestedStruct)
+            % If input is not a struct, return empty
+            return;
+        end
+
+        fields = fieldnames(nestedStruct);
+
+        for i = 1:length(fields)
+            fieldName = fields{i};
+            fieldValue = nestedStruct.(fieldName);
+
+            % Create the flattened field name
+            if isempty(prefix)
+                flatFieldName = fieldName;
+            else
+                flatFieldName = [prefix '_' fieldName];
+            end
+
+            % Check if this field is a struct (nested) or a signal (array)
+            if isstruct(fieldValue)
+                % Recursively flatten nested struct
+                nestedFlat = flattenNestedStruct(fieldValue, flatFieldName);
+                nestedFields = fieldnames(nestedFlat);
+
+                % Copy flattened fields to output
+                for j = 1:length(nestedFields)
+                    flatStruct.(nestedFields{j}) = nestedFlat.(nestedFields{j});
+                end
+
+            elseif isnumeric(fieldValue) || islogical(fieldValue)
+                % This is a signal (numeric or logical array)
+                % Add it to the flat structure
+                flatStruct.(flatFieldName) = fieldValue;
+
+            else
+                % Skip non-numeric, non-struct fields (e.g., strings, cells)
+                warning('Skipping field "%s" (type: %s) - only numeric/logical arrays supported', ...
+                        flatFieldName, class(fieldValue));
+            end
+        end
+    end
+
     function data = generateSyntheticData()
         % Generate realistic synthetic data for demonstration
         fprintf('Generating synthetic data...\n');
@@ -1668,19 +1817,29 @@ end % --- THIS ENDS THE MAIN FUNCTION ---
         tau = 3.0; % Time constant
         
         % External signals with different characteristics
+        % DEMONSTRATION: Using NESTED STRUCTURE to show flexibility
         external = struct();
-        
-        % Signal A: Will cause drift during off-time
-        external.sig_A_drift = 5 + 3 * smoothdata(randn(n,1), 'gaussian', 500);
-        
-        % Signal B: Will affect recovery time constant
-        external.sig_B_dynamics = 1 + 0.5 * smoothdata(randn(n,1), 'gaussian', 1000);
-        
-        % Signal C: Distractor
-        external.sig_C_distractor = smoothdata(randn(n,1), 'gaussian', 100);
-        
-        % Signal F (NEW): Will cause non-zero settling
-        external.sig_F_settling = 0.5 * smoothdata(randn(n,1), 'gaussian', 800);
+
+        % Nested under 'environmental' category
+        external.environmental.temperature = 5 + 3 * smoothdata(randn(n,1), 'gaussian', 500);
+        external.environmental.humidity = 50 + 10 * smoothdata(randn(n,1), 'gaussian', 800);
+
+        % Nested under 'system' category
+        external.system.voltage = 12 + 0.5 * smoothdata(randn(n,1), 'gaussian', 1000);
+        external.system.current = 2 + 0.3 * smoothdata(randn(n,1), 'gaussian', 600);
+
+        % Nested under 'sensors' category
+        external.sensors.noise = smoothdata(randn(n,1), 'gaussian', 100);
+        external.sensors.vibration = 0.5 * smoothdata(randn(n,1), 'gaussian', 300);
+
+        % Top-level signal (not nested)
+        external.reference_signal = 0.5 * smoothdata(randn(n,1), 'gaussian', 800);
+
+        % Map to original variable names for simulation logic
+        sig_A_drift = external.environmental.temperature;
+        sig_B_dynamics = external.system.voltage / 12; % Normalize to ~1
+        sig_C_distractor = external.sensors.noise;
+        sig_F_settling = external.reference_signal;
         
         % Simulate response with realistic control dynamics
         for i = 2:n
