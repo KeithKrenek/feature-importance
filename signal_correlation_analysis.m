@@ -1,3 +1,4 @@
+function signal_correlation_analysis()
 %% ========================================================================
 %  SIGNAL CORRELATION ANALYSIS
 %  Analysis of External Signal Influence on Control System Response
@@ -5,12 +6,11 @@
 %
 %  Features:
 %  - Advanced dynamic feature extraction (time constants, damping, etc.)
-%  - Cascading event detection and handling
+%  - Dynamic analysis windows (prevents event overlap)
+%  - Robust feature extraction (non-zero settling, final slope)
+%  - Fit-quality metrics (R-squared as a feature)
 %  - Multiple statistical methods (Correlation, Random Forest, MI, Granger)
 %  - Robust statistical testing with multiple comparison correction
-%  - Interaction effect detection
-%  - Time-lagged analysis
-%  - Publication-quality visualizations
 %
 %  Author: KK
 %  Date: 2025
@@ -24,7 +24,7 @@ clearvars; clc; close all;
 %  ========================================================================
 
 fprintf('\n========================================\n');
-fprintf('PUBLICATION-GRADE SIGNAL ANALYSIS\n');
+fprintf('SIGNAL ANALYSIS\n');
 fprintf('========================================\n\n');
 
 % ---------------------- DATA LOADING ----------------------
@@ -46,7 +46,8 @@ params.preEventWindow = 5;          % seconds before power-on
 params.postEventWindow = 15;        % seconds after power-on for dynamics
 params.minOffDuration = 1;          % minimum power-off duration (seconds)
 params.settlingThreshold = 0.02;    % 2% of initial value for settling
-params.samplingRate = 100;          % Hz
+params.samplingRate = 1 / median(diff(data.time)); % Auto-detect sample rate
+dt = 1/params.samplingRate;
 
 % Event classification
 params.cascadeWindow = 10;          % seconds - if previous event within this, flag as cascade
@@ -72,7 +73,7 @@ params.rf.minLeafSize = 5;
 params.outlierMethod = 'MAD';       % 'MAD' (Median Absolute Deviation) or 'IQR'
 params.outlierThreshold = 3;        % MAD multiplier or IQR multiplier
 
-fprintf('Configuration loaded.\n\n');
+fprintf('Configuration loaded. Detected Sampling Rate: %.1f Hz\n\n', params.samplingRate);
 
 %% ========================================================================
 %  SECTION 2: EVENT DETECTION AND CLASSIFICATION
@@ -80,9 +81,13 @@ fprintf('Configuration loaded.\n\n');
 
 fprintf('Step 1: Detecting and classifying power-on events...\n');
 
-dt = 1/params.samplingRate;
+% Find power-on (rising) edges
 powerOnEdges = diff([0; data.powerOn(:)]) > 0;
 powerOnIndices = find(powerOnEdges);
+
+%% <-- IMPROVEMENT: Find power-off (falling) edges for dynamic window
+powerOffEdges = diff([1; data.powerOn(:)]) < 0; 
+powerOffIndices = find(powerOffEdges);
 
 preWindow_samples = round(params.preEventWindow / dt);
 postWindow_samples = round(params.postEventWindow / dt);
@@ -90,6 +95,7 @@ postWindow_samples = round(params.postEventWindow / dt);
 % Event metadata structure
 events = struct();
 validEventMask = false(size(powerOnIndices));
+validEventCount = 0;
 
 for i = 1:length(powerOnIndices)
     idx = powerOnIndices(i);
@@ -117,12 +123,14 @@ for i = 1:length(powerOnIndices)
     timeSincePrevious = inf;
     responseMagnitudeBeforeOff = abs(data.response(offStartIdx));
     
-    if i > 1 && validEventMask(i-1)
-        timeSincePrevious = (idx - powerOnIndices(i-1)) * dt;
+    if i > 1 && any(validEventMask(1:i-1))
+        lastValidEventIdx = find(validEventMask(1:i-1), 1, 'last');
+        timeSincePrevious = (idx - powerOnIndices(lastValidEventIdx)) * dt;
+        
         if timeSincePrevious < params.cascadeWindow
             isCascade = true;
             % Check if system had settled
-            prevResponseAtPowerOn = data.response(powerOnIndices(i-1));
+            prevResponseAtPowerOn = data.response(powerOnIndices(lastValidEventIdx));
             if responseMagnitudeBeforeOff > params.settlingCriterion * abs(prevResponseAtPowerOn)
                 isCascade = true;
             end
@@ -131,25 +139,42 @@ for i = 1:length(powerOnIndices)
     
     % Mark as valid and store metadata
     validEventMask(i) = true;
-    eventNum = sum(validEventMask);
+    validEventCount = validEventCount + 1;
     
-    events(eventNum).index = idx;
-    events(eventNum).time = data.time(idx);
-    events(eventNum).offStartIdx = offStartIdx;
-    events(eventNum).offDuration = offDuration;
-    events(eventNum).isCascade = isCascade;
-    events(eventNum).timeSincePrevious = timeSincePrevious;
-    events(eventNum).initialCondition = initialCondition;
-    events(eventNum).responseMagnitudeBeforeOff = responseMagnitudeBeforeOff;
+    events(validEventCount).index = idx;
+    events(validEventCount).time = data.time(idx);
+    events(validEventCount).offStartIdx = offStartIdx;
+    events(validEventCount).offDuration = offDuration;
+    events(validEventCount).isCascade = isCascade;
+    events(validEventCount).timeSincePrevious = timeSincePrevious;
+    events(validEventCount).initialCondition = initialCondition;
+    events(validEventCount).responseMagnitudeBeforeOff = responseMagnitudeBeforeOff;
+    
+    %% <-- IMPROVEMENT: Find time until the *next* power-off event
+    nextOffEvent = powerOffIndices(find(powerOffIndices > idx, 1, 'first'));
+    if isempty(nextOffEvent)
+        events(validEventCount).timeUntilNextOff = inf;
+    else
+        events(validEventCount).timeUntilNextOff = (nextOffEvent - idx) * dt;
+    end
+    
 end
 
 numEvents = length(events);
 fprintf('  Found %d valid power-on events\n', numEvents);
-fprintf('  - Clean starts: %d\n', sum(~[events.isCascade]));
-fprintf('  - Cascade events: %d\n\n', sum([events.isCascade]));
+
+if numEvents > 0
+    fprintf('  - Clean starts: %d\n', sum(~[events.isCascade]));
+    fprintf('  - Cascade events: %d\n\n', sum([events.isCascade]));
+else
+    fprintf('  - No valid events found.\n\n');
+end
 
 if numEvents < 10
     warning('Low sample size (n=%d). Results may lack statistical power.', numEvents);
+    if numEvents == 0
+        error('No valid events found. Aborting analysis.');
+    end
 end
 
 %% ========================================================================
@@ -159,36 +184,69 @@ end
 fprintf('Step 2: Extracting advanced response signal features...\n');
 
 responseFeatures = struct();
-featureNames = {};
+responseFeatureNames = {};
 
-% Initialize feature arrays
-initializeResponseFeature('valueAtPowerOn');
-initializeResponseFeature('initialCondition');
-initializeResponseFeature('absValueAtPowerOn');
-initializeResponseFeature('initialSlope');
-initializeResponseFeature('slopeAt1s');
-initializeResponseFeature('slopeAt3s');
-initializeResponseFeature('timeConstant');
-initializeResponseFeature('dampingRatio');
-initializeResponseFeature('naturalFrequency');
-initializeResponseFeature('riseTime90');
-initializeResponseFeature('settlingTime2pct');
-initializeResponseFeature('settlingTime5pct');
-initializeResponseFeature('overshoot');
-initializeResponseFeature('peakRecovery');
-initializeResponseFeature('peakTime');
-initializeResponseFeature('rmsError');
-initializeResponseFeature('mae');
-initializeResponseFeature('iae');
-initializeResponseFeature('ise');
-initializeResponseFeature('itae');
-initializeResponseFeature('dominantFrequency');
-initializeResponseFeature('spectralPower_lowFreq');
-initializeResponseFeature('spectralPower_midFreq');
-initializeResponseFeature('spectralPower_highFreq');
-initializeResponseFeature('recoveryRate');
-initializeResponseFeature('isCascadeEvent');
-initializeResponseFeature('offDuration');
+responseFeatureNames{end+1} = 'valueAtPowerOn';
+responseFeatures.valueAtPowerOn = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'initialCondition';
+responseFeatures.initialCondition = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'absValueAtPowerOn';
+responseFeatures.absValueAtPowerOn = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'initialSlope';
+responseFeatures.initialSlope = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'slopeAt1s';
+responseFeatures.slopeAt1s = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'slopeAt3s';
+responseFeatures.slopeAt3s = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'timeConstant';
+responseFeatures.timeConstant = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'dampingRatio';
+responseFeatures.dampingRatio = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'naturalFrequency';
+responseFeatures.naturalFrequency = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'riseTime90';
+responseFeatures.riseTime90 = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'settlingTime2pct';
+responseFeatures.settlingTime2pct = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'settlingTime5pct';
+responseFeatures.settlingTime5pct = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'overshoot';
+responseFeatures.overshoot = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'peakRecovery';
+responseFeatures.peakRecovery = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'peakTime';
+responseFeatures.peakTime = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'rmsError';
+responseFeatures.rmsError = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'mae';
+responseFeatures.mae = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'iae';
+responseFeatures.iae = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'ise';
+responseFeatures.ise = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'itae';
+responseFeatures.itae = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'dominantFrequency';
+responseFeatures.dominantFrequency = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'spectralPower_lowFreq';
+responseFeatures.spectralPower_lowFreq = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'spectralPower_midFreq';
+responseFeatures.spectralPower_midFreq = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'spectralPower_highFreq';
+responseFeatures.spectralPower_highFreq = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'recoveryRate';
+responseFeatures.recoveryRate = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'isCascadeEvent';
+responseFeatures.isCascadeEvent = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'offDuration';
+responseFeatures.offDuration = nan(numEvents, 1);
+
+responseFeatureNames{end+1} = 'finalSettlingValue';
+responseFeatures.finalSettlingValue = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'finalSlope';
+responseFeatures.finalSlope = nan(numEvents, 1);
+responseFeatureNames{end+1} = 'timeConstant_R2';
+responseFeatures.timeConstant_R2 = nan(numEvents, 1);
 
 for i = 1:numEvents
     idx = events(i).index;
@@ -200,9 +258,17 @@ for i = 1:numEvents
     responseFeatures.isCascadeEvent(i) = double(events(i).isCascade);
     responseFeatures.offDuration(i) = events(i).offDuration;
     
+    %% <-- IMPROVEMENT: Use dynamic window based on timeUntilNextOff
+    % Calculate the dynamic window size (max_window OR time_to_next_event)
+    % Subtract 1 sample to avoid overlapping with the off-event itself
+    dynamicPostSamples = min(postWindow_samples, round(events(i).timeUntilNextOff / dt) - 1);
+    if dynamicPostSamples <= 1
+        continue; % Not enough data to analyze this event
+    end
+    
     % Post power-on segment
-    postSegment = data.response(idx:idx+postWindow_samples);
-    timePost = (0:length(postSegment)-1) * dt;
+    postSegment = data.response(idx:min(idx + dynamicPostSamples, length(data.response)));
+    timePost = (0:length(postSegment)-1)' * dt;
     
     % Initial slope (first 0.5 seconds)
     slopeWindow1 = min(round(0.5/dt), length(postSegment));
@@ -226,23 +292,37 @@ for i = 1:numEvents
         responseFeatures.slopeAt3s(i) = p(1);
     end
     
+    %% <-- IMPROVEMENT: Add finalSlope (drift) calculation
+    % Final slope (last 2 seconds of *dynamic* window)
+    finalSlopeWindowStart = max(1, length(postSegment) - round(2/dt));
+    finalSlopeWindowEnd = length(postSegment);
+    if (finalSlopeWindowEnd - finalSlopeWindowStart) > 10
+        p = polyfit(timePost(finalSlopeWindowStart:finalSlopeWindowEnd), postSegment(finalSlopeWindowStart:finalSlopeWindowEnd), 1);
+        responseFeatures.finalSlope(i) = p(1);
+    end
+    
     % Time constant estimation (exponential fit)
     fitWindow = min(round(params.expFitWindow/dt), length(postSegment));
     if fitWindow > 10 && abs(postSegment(1)) > 1e-6
         try
             % Fit: y = A*exp(-t/tau) + C
             fo = fitoptions('Method', 'NonlinearLeastSquares', ...
-                           'Lower', [0, 0, -inf], ...
-                           'Upper', [inf, inf, inf], ...
-                           'StartPoint', [abs(postSegment(1)), 1, 0]);
+                           'Lower', [-Inf, 0, -Inf], ...
+                           'Upper', [Inf, Inf, Inf], ...
+                           'StartPoint', [postSegment(1), 1, mean(postSegment(end-5:end))]);
             ft = fittype('A*exp(-x/tau) + C', 'options', fo);
-            [fitResult, gof] = fit(timePost(1:fitWindow)', postSegment(1:fitWindow), ft);
+            [fitResult, gof] = fit(timePost(1:fitWindow), postSegment(1:fitWindow), ft);
+            
+            %% <-- IMPROVEMENT: Store fit quality (R2) as a feature
+            responseFeatures.timeConstant_R2(i) = gof.rsquare;
             
             if gof.rsquare > 0.5
                 responseFeatures.timeConstant(i) = fitResult.tau;
+                %% <-- IMPROVEMENT: Store non-zero settling value (C)
+                responseFeatures.finalSettlingValue(i) = fitResult.C;
             end
         catch
-            responseFeatures.timeConstant(i) = NaN;
+            % warning('Exponential fit failed for event %d', i);
         end
     end
     
@@ -252,10 +332,12 @@ for i = 1:numEvents
     if length(zeroCrossings) >= 2
         % Estimate natural frequency from zero crossings
         period = 2 * mean(diff(timePost(zeroCrossings)));
-        responseFeatures.naturalFrequency(i) = 1/period;
+        if period > 0
+            responseFeatures.naturalFrequency(i) = 1/period;
+        end
         
         % Estimate damping from decay envelope
-        peaks = findpeaks(abs(postSegment));
+        [peaks, ~] = findpeaks(abs(postSegment));
         if length(peaks) >= 2
             logDec = log(peaks(1)/peaks(2));
             responseFeatures.dampingRatio(i) = logDec / sqrt((2*pi)^2 + logDec^2);
@@ -263,14 +345,14 @@ for i = 1:numEvents
     end
     
     % Rise time (10% to 90% of final value)
-    finalValue = mean(postSegment(end-round(0.1/dt):end));
+    finalValue = mean(postSegment(max(1, end-round(0.1/dt)):end));
     val10 = 0.1 * (finalValue - postSegment(1)) + postSegment(1);
     val90 = 0.9 * (finalValue - postSegment(1)) + postSegment(1);
     
-    if postSegment(1) < finalValue
+    if postSegment(1) < finalValue % rising
         idx10 = find(postSegment > val10, 1, 'first');
         idx90 = find(postSegment > val90, 1, 'first');
-    else
+    else % falling
         idx10 = find(postSegment < val10, 1, 'first');
         idx90 = find(postSegment < val90, 1, 'first');
     end
@@ -286,24 +368,24 @@ for i = 1:numEvents
     settleIdx2 = find(abs(postSegment) < threshold2pct, 1, 'first');
     settleIdx5 = find(abs(postSegment) < threshold5pct, 1, 'first');
     
-    responseFeatures.settlingTime2pct(i) = settleIdx2 * dt;
-    responseFeatures.settlingTime5pct(i) = settleIdx5 * dt;
-    
-    if isempty(settleIdx2)
+    if ~isempty(settleIdx2)
+        responseFeatures.settlingTime2pct(i) = timePost(settleIdx2);
+    else
         responseFeatures.settlingTime2pct(i) = params.postEventWindow;
     end
-    if isempty(settleIdx5)
+    if ~isempty(settleIdx5)
+        responseFeatures.settlingTime5pct(i) = timePost(settleIdx5);
+    else
         responseFeatures.settlingTime5pct(i) = params.postEventWindow;
     end
     
     % Overshoot (if crosses zero)
-    if sign(postSegment(1)) ~= sign(postSegment(end))
+    if sign(postSegment(1)) * sign(finalValue) < 0
         [maxVal, maxIdx] = max(abs(postSegment));
         responseFeatures.overshoot(i) = maxVal;
         responseFeatures.peakTime(i) = timePost(maxIdx);
     else
         responseFeatures.overshoot(i) = 0;
-        responseFeatures.peakTime(i) = NaN;
     end
     
     % Peak recovery
@@ -314,11 +396,13 @@ for i = 1:numEvents
     responseFeatures.mae(i) = mean(abs(postSegment));
     responseFeatures.iae(i) = trapz(timePost, abs(postSegment));
     responseFeatures.ise(i) = trapz(timePost, postSegment.^2);
-    responseFeatures.itae(i) = trapz(timePost, timePost' .* abs(postSegment));
+    responseFeatures.itae(i) = trapz(timePost, timePost .* abs(postSegment));
     
     % Recovery rate (average rate of return to zero in first 5 seconds)
     recoveryWindow = min(round(5/dt), length(postSegment));
-    responseFeatures.recoveryRate(i) = abs(postSegment(1) - postSegment(recoveryWindow)) / (recoveryWindow * dt);
+    if recoveryWindow > 1
+        responseFeatures.recoveryRate(i) = abs(postSegment(1) - postSegment(recoveryWindow)) / (recoveryWindow * dt);
+    end
     
     % Frequency domain analysis
     if length(postSegment) > 64
@@ -342,7 +426,6 @@ for i = 1:numEvents
     end
 end
 
-responseFeatureNames = fieldnames(responseFeatures);
 fprintf('  Extracted %d response features\n\n', length(responseFeatureNames));
 
 %% ========================================================================
@@ -355,30 +438,35 @@ externalFields = fieldnames(data.external);
 numExternal = length(externalFields);
 
 externalFeatures = struct();
-externalFeatureNames = {};
 
+% --- FIX: Helper function 'initializeExternalFeature' is inlined ---
+% --- This correctly pre-allocates the struct fields. ---
 for j = 1:numExternal
     signalName = externalFields{j};
-    signal = data.external.(signalName);
     
-    % Initialize arrays
-    initializeExternalFeature([signalName '_atPowerOn']);
-    initializeExternalFeature([signalName '_derivative_atPowerOn']);
-    initializeExternalFeature([signalName '_meanDuringOff']);
-    initializeExternalFeature([signalName '_stdDuringOff']);
-    initializeExternalFeature([signalName '_minDuringOff']);
-    initializeExternalFeature([signalName '_maxDuringOff']);
-    initializeExternalFeature([signalName '_rangeDuringOff']);
-    initializeExternalFeature([signalName '_trendDuringOff']);
-    initializeExternalFeature([signalName '_volatility']);
+    externalFeatures.([signalName '_atPowerOn']) = nan(numEvents, 1);
+    externalFeatures.([signalName '_derivative_atPowerOn']) = nan(numEvents, 1);
+    externalFeatures.([signalName '_meanDuringOff']) = nan(numEvents, 1);
+    externalFeatures.([signalName '_stdDuringOff']) = nan(numEvents, 1);
+    externalFeatures.([signalName '_minDuringOff']) = nan(numEvents, 1);
+    externalFeatures.([signalName '_maxDuringOff']) = nan(numEvents, 1);
+    externalFeatures.([signalName '_rangeDuringOff']) = nan(numEvents, 1);
+    externalFeatures.([signalName '_trendDuringOff']) = nan(numEvents, 1);
+    externalFeatures.([signalName '_volatility']) = nan(numEvents, 1);
     
     % Time-lagged features
     for lagIdx = 1:length(params.timeLags)
         lag = params.timeLags(lagIdx);
         lagName = sprintf('%s_lag%.1fs', signalName, lag);
         lagName = strrep(lagName, '.', 'p');
-        initializeExternalFeature(lagName);
+        externalFeatures.(lagName) = nan(numEvents, 1);
     end
+end
+% --- End of inlined helper ---
+
+for j = 1:numExternal
+    signalName = externalFields{j};
+    signal = data.external.(signalName);
     
     % Compute signal derivative
     signalDerivative = [0; diff(signal)] * params.samplingRate;
@@ -435,16 +523,13 @@ fprintf('  Extracted %d external signal features\n\n', length(externalFeatureNam
 
 fprintf('Step 4: Computing interaction features...\n');
 
-% Create key interaction terms between most variable external signals
-% We'll compute products of top external signals
-
 % Calculate variance of each external signal at power-on
 externalVarAtPowerOn = zeros(numExternal, 1);
 for j = 1:numExternal
     signalName = externalFields{j};
     featName = [signalName '_atPowerOn'];
     if isfield(externalFeatures, featName)
-        externalVarAtPowerOn(j) = var(externalFeatures.(featName));
+        externalVarAtPowerOn(j) = var(externalFeatures.(featName), 'omitnan');
     end
 end
 
@@ -464,12 +549,13 @@ for j1 = 1:numInteractions
         if isfield(externalFeatures, feat1Name) && isfield(externalFeatures, feat2Name)
             interactionName = sprintf('interaction_%s_x_%s', sig1Name, sig2Name);
             externalFeatures.(interactionName) = externalFeatures.(feat1Name) .* externalFeatures.(feat2Name);
-            externalFeatureNames{end+1} = interactionName;
             interactionCount = interactionCount + 1;
         end
     end
 end
 
+% Get updated list of external feature names
+externalFeatureNames = fieldnames(externalFeatures);
 fprintf('  Created %d interaction features\n\n', interactionCount);
 
 %% ========================================================================
@@ -479,7 +565,7 @@ fprintf('  Created %d interaction features\n\n', interactionCount);
 fprintf('Step 5: Detecting and handling outliers...\n');
 
 % Combine all features
-allFeatureNames = [responseFeatureNames; externalFeatureNames];
+allFeatureNames = [responseFeatureNames'; externalFeatureNames]; %% <-- FIX: Transpose responseFeatureNames
 allFeatures = zeros(numEvents, length(allFeatureNames));
 
 for f = 1:length(responseFeatureNames)
@@ -503,17 +589,18 @@ for f = 1:size(allFeatures, 2)
     
     if strcmpi(params.outlierMethod, 'MAD')
         medianX = median(x);
-        mad = median(abs(x - medianX));
-        if mad > 0
-            outlierMask(:, f) = abs(allFeatures(:, f) - medianX) > params.outlierThreshold * mad * 1.4826;
+        madVal = median(abs(x - medianX));
+        if madVal > 0
+            mad_scaled = madVal * 1.4826;
+            outlierMask(:, f) = abs(allFeatures(:, f) - medianX) > params.outlierThreshold * mad_scaled;
         end
     elseif strcmpi(params.outlierMethod, 'IQR')
         q25 = prctile(x, 25);
         q75 = prctile(x, 75);
-        iqr = q75 - q25;
-        if iqr > 0
-            outlierMask(:, f) = allFeatures(:, f) < (q25 - params.outlierThreshold * iqr) | ...
-                                allFeatures(:, f) > (q75 + params.outlierThreshold * iqr);
+        iqrVal = q75 - q25;
+        if iqrVal > 0
+            outlierMask(:, f) = allFeatures(:, f) < (q25 - params.outlierThreshold * iqrVal) | ...
+                                allFeatures(:, f) > (q75 + params.outlierThreshold * iqrVal);
         end
     end
 end
@@ -534,10 +621,12 @@ fprintf('Step 6: Performing correlation analysis...\n');
 
 correlationResults = struct();
 
+%% <-- IMPROVEMENT: Add new robust features to the analysis list
 % Response metrics to analyze (select key dynamic metrics)
 responseMetricsToAnalyze = {'valueAtPowerOn', 'absValueAtPowerOn', ...
                              'timeConstant', 'settlingTime2pct', ...
-                             'recoveryRate', 'iae', 'peakRecovery'};
+                             'recoveryRate', 'iae', 'peakRecovery', ...
+                             'finalSettlingValue', 'finalSlope', 'timeConstant_R2'};
 
 for m = 1:length(responseMetricsToAnalyze)
     metricName = responseMetricsToAnalyze{m};
@@ -555,10 +644,10 @@ for m = 1:length(responseMetricsToAnalyze)
         corrMethod = params.correlationMethods{corrType};
         
         corrResults = struct();
-        corrResults.correlations = zeros(length(externalFeatureNames), 1);
-        corrResults.pValues = zeros(length(externalFeatureNames), 1);
-        corrResults.ciLower = zeros(length(externalFeatureNames), 1);
-        corrResults.ciUpper = zeros(length(externalFeatureNames), 1);
+        corrResults.correlations = nan(length(externalFeatureNames), 1);
+        corrResults.pValues = ones(length(externalFeatureNames), 1);
+        corrResults.ciLower = nan(length(externalFeatureNames), 1);
+        corrResults.ciUpper = nan(length(externalFeatureNames), 1);
         
         for f = 1:length(externalFeatureNames)
             externalData = externalFeatures.(externalFeatureNames{f});
@@ -567,31 +656,31 @@ for m = 1:length(responseMetricsToAnalyze)
             if sum(validIdx) > 10
                 % Compute correlation
                 [r, p] = corr(responseData(validIdx), externalData(validIdx), ...
-                              'Type', corrMethod);
+                              'Type', corrMethod, 'Rows', 'complete');
                 
                 corrResults.correlations(f) = r;
                 corrResults.pValues(f) = p;
                 
                 % Bootstrap confidence intervals
                 if params.numBootstrap > 0
-                    bootR = bootstrp(params.numBootstrap, ...
-                                    @(x,y) corr(x, y, 'Type', corrMethod), ...
-                                    responseData(validIdx), externalData(validIdx));
-                    corrResults.ciLower(f) = prctile(bootR, 2.5);
-                    corrResults.ciUpper(f) = prctile(bootR, 97.5);
+                    try
+                        bootR = bootstrp(params.numBootstrap, ...
+                                        @(x,y) corr(x, y, 'Type', corrMethod, 'Rows', 'complete'), ...
+                                        responseData(validIdx), externalData(validIdx));
+                        corrResults.ciLower(f) = prctile(bootR, 2.5);
+                        corrResults.ciUpper(f) = prctile(bootR, 97.5);
+                    catch
+                        % bootstrap can fail with NaNs, though 'complete' should handle
+                    end
                 end
-            else
-                corrResults.correlations(f) = 0;
-                corrResults.pValues(f) = 1;
             end
         end
         
         % Multiple testing correction
         if strcmpi(params.multipleTestCorrection, 'Bonferroni')
-            corrResults.pValues_adjusted = corrResults.pValues * length(externalFeatureNames);
-            corrResults.pValues_adjusted(corrResults.pValues_adjusted > 1) = 1;
+            corrResults.pValues_adjusted = min(1, corrResults.pValues * length(externalFeatureNames));
         elseif strcmpi(params.multipleTestCorrection, 'FDR')
-            [~, ~, corrResults.pValues_adjusted] = fdr_bh(corrResults.pValues, params.alphaLevel);
+            [~, ~, ~, corrResults.pValues_adjusted] = fdr_bh(corrResults.pValues, params.alphaLevel);
         else
             corrResults.pValues_adjusted = corrResults.pValues;
         end
@@ -631,10 +720,16 @@ featureNamesClean = externalFeatureNames(validColIdx);
 for f = 1:size(X_clean, 2)
     nanIdx = isnan(X_clean(:, f));
     if any(nanIdx)
-        X_clean(nanIdx, f) = median(X_clean(~nanIdx, f));
+        medVal = median(X_clean(~nanIdx, f));
+        if isfinite(medVal)
+            X_clean(nanIdx, f) = medVal;
+        else % if median is NaN (all data was NaN)
+            X_clean(nanIdx, f) = 0; % impute with 0
+        end
     end
 end
 
+% The new metrics from responseMetricsToAnalyze will be included here
 for m = 1:length(responseMetricsToAnalyze)
     metricName = responseMetricsToAnalyze{m};
     
@@ -658,7 +753,8 @@ for m = 1:length(responseMetricsToAnalyze)
         rf = TreeBagger(params.rf.numTrees, X_rf, y_rf, ...
                        'Method', 'regression', ...
                        'OOBPredictorImportance', 'on', ...
-                       'MinLeafSize', params.rf.minLeafSize);
+                       'MinLeafSize', params.rf.minLeafSize, ...
+                       'PredictorNames', featureNamesClean);
         
         % Feature importance
         importance = rf.OOBPermutedPredictorDeltaError;
@@ -690,6 +786,7 @@ fprintf('Step 8: Computing Mutual Information...\n');
 
 miResults = struct();
 
+% The new metrics from responseMetricsToAnalyze will be included here
 for m = 1:length(responseMetricsToAnalyze)
     metricName = responseMetricsToAnalyze{m};
     
@@ -700,7 +797,7 @@ for m = 1:length(responseMetricsToAnalyze)
     responseData = responseFeatures.(metricName);
     validResponseIdx = isfinite(responseData) & ~outlierEventMask;
     
-    miScores = zeros(length(externalFeatureNames), 1);
+    miScores = nan(length(externalFeatureNames), 1);
     
     for f = 1:length(externalFeatureNames)
         externalData = externalFeatures.(externalFeatureNames{f});
@@ -722,8 +819,9 @@ for m = 1:length(responseMetricsToAnalyze)
     end
     
     % Normalize MI scores
-    if max(miScores) > 0
-        miScores = miScores / max(miScores);
+    maxMI = max(miScores);
+    if maxMI > 0
+        miScores = miScores / maxMI;
     end
     
     [~, sortIdx] = sort(miScores, 'descend');
@@ -744,6 +842,7 @@ fprintf('Step 9: Computing Partial Correlations...\n');
 
 partialCorrResults = struct();
 
+% The new metrics from responseMetricsToAnalyze will be included here
 for m = 1:length(responseMetricsToAnalyze)
     metricName = responseMetricsToAnalyze{m};
     
@@ -763,30 +862,35 @@ for m = 1:length(responseMetricsToAnalyze)
     end
     
     % Compute partial correlations (correlation after controlling for all other variables)
-    partialCorrs = zeros(size(X, 2), 1);
-    pValues = zeros(size(X, 2), 1);
+    partialCorrs = nan(size(X, 2), 1);
+    pValues = ones(size(X, 2), 1);
     
     for f = 1:size(X, 2)
         % Regress y on all other X variables
-        X_others = X(:, setdiff(1:size(X,2), f));
+        X_others_idx = setdiff(1:size(X,2), f);
+        X_others = X(:, X_others_idx);
         
-        % Remove any remaining NaN columns
-        validCols = sum(isnan(X_others)) == 0;
+        % Remove any NaN columns or constant columns
+        validCols = var(X_others, 'omitnan') > 0;
         X_others = X_others(:, validCols);
         
         if size(X_others, 2) > 0 && rank(X_others) == size(X_others, 2)
-            % Residuals of y after accounting for other variables
-            beta_y = X_others \ y;
-            resid_y = y - X_others * beta_y;
-            
-            % Residuals of X(:,f) after accounting for other variables
-            beta_x = X_others \ X(:, f);
-            resid_x = X(:, f) - X_others * beta_x;
-            
-            % Correlation of residuals
-            [r, p] = corr(resid_y, resid_x);
-            partialCorrs(f) = r;
-            pValues(f) = p;
+            try
+                % Residuals of y after accounting for other variables
+                beta_y = X_others \ y;
+                resid_y = y - X_others * beta_y;
+                
+                % Residuals of X(:,f) after accounting for other variables
+                beta_x = X_others \ X(:, f);
+                resid_x = X(:, f) - X_others * beta_x;
+                
+                % Correlation of residuals
+                [r, p] = corr(resid_y, resid_x, 'Rows', 'complete');
+                partialCorrs(f) = r;
+                pValues(f) = p;
+            catch
+                % regression failed
+            end
         end
     end
     
@@ -812,7 +916,7 @@ grangerResults = struct();
 % For each external signal, test if it Granger-causes the response
 % This requires time-series analysis on the raw signals
 
-maxLag = round(2 * params.samplingRate); % Test up to 2 seconds of lag
+maxLag = round(1 / dt); % Test up to 1 second of lag
 
 for j = 1:numExternal
     signalName = externalFields{j};
@@ -857,26 +961,28 @@ fprintf('Step 11: Consolidating results across methods...\n');
 % Create consensus ranking by averaging normalized ranks across methods
 consensusRanking = struct();
 
+% The new metrics from responseMetricsToAnalyze will be included here
 for m = 1:length(responseMetricsToAnalyze)
     metricName = responseMetricsToAnalyze{m};
     
+    if ~isfield(responseFeatures, metricName)
+        continue; % Skip if no data was generated
+    end
+    
     % Initialize ranks matrix
     numFeatures = length(externalFeatureNames);
-    ranksMatrix = zeros(numFeatures, 4); % 4 methods: Pearson, RF, MI, Partial
-    methodCount = 0;
+    ranksMatrix = nan(numFeatures, 4); % 4 methods: Pearson, RF, MI, Partial
     
     % Pearson correlation ranks
     if isfield(correlationResults, metricName) && isfield(correlationResults.(metricName), 'Pearson')
-        methodCount = methodCount + 1;
         absCorr = abs(correlationResults.(metricName).Pearson.correlations);
         [~, ~, ranks] = unique(absCorr);
-        ranksMatrix(:, methodCount) = max(ranks) - ranks + 1; % Reverse so higher is better
+        ranksMatrix(:, 1) = max(ranks) - ranks + 1; % Reverse so 1 is best
     end
     
     % Random Forest importance ranks
     if isfield(rfResults, metricName)
-        methodCount = methodCount + 1;
-        importance = zeros(numFeatures, 1);
+        importance = nan(numFeatures, 1);
         featureNamesRF = rfResults.(metricName).featureNames;
         for f = 1:length(featureNamesRF)
             idx = find(strcmp(externalFeatureNames, featureNamesRF{f}), 1);
@@ -885,21 +991,19 @@ for m = 1:length(responseMetricsToAnalyze)
             end
         end
         [~, ~, ranks] = unique(importance);
-        ranksMatrix(:, methodCount) = max(ranks) - ranks + 1;
+        ranksMatrix(:, 2) = max(ranks) - ranks + 1;
     end
     
     % Mutual Information ranks
     if isfield(miResults, metricName)
-        methodCount = methodCount + 1;
         miScores = miResults.(metricName).scores;
         [~, ~, ranks] = unique(miScores);
-        ranksMatrix(:, methodCount) = max(ranks) - ranks + 1;
+        ranksMatrix(:, 3) = max(ranks) - ranks + 1;
     end
     
     % Partial correlation ranks
     if isfield(partialCorrResults, metricName)
-        methodCount = methodCount + 1;
-        partialCorr = zeros(numFeatures, 1);
+        partialCorr = nan(numFeatures, 1);
         featureNamesPC = partialCorrResults.(metricName).featureNames;
         for f = 1:length(featureNamesPC)
             idx = find(strcmp(externalFeatureNames, featureNamesPC{f}), 1);
@@ -908,19 +1012,18 @@ for m = 1:length(responseMetricsToAnalyze)
             end
         end
         [~, ~, ranks] = unique(partialCorr);
-        ranksMatrix(:, methodCount) = max(ranks) - ranks + 1;
+        ranksMatrix(:, 4) = max(ranks) - ranks + 1;
     end
     
-    % Average ranks
-    if methodCount > 0
-        avgRank = mean(ranksMatrix(:, 1:methodCount), 2);
-        [~, sortIdx] = sort(avgRank, 'descend');
-        
-        consensusRanking.(metricName) = struct();
-        consensusRanking.(metricName).avgRank = avgRank;
-        consensusRanking.(metricName).sortedIndices = sortIdx;
-        consensusRanking.(metricName).featureNames = externalFeatureNames;
-    end
+    % Average ranks (ignoring NaNs from failed methods)
+    avgRank = mean(ranksMatrix, 2, 'omitnan');
+    [~, sortIdx] = sort(avgRank, 'asc'); % 'asc' because 1 is best rank
+    
+    consensusRanking.(metricName) = struct();
+    consensusRanking.(metricName).avgRank = avgRank;
+    consensusRanking.(metricName).sortedIndices = sortIdx;
+    consensusRanking.(metricName).featureNames = externalFeatureNames;
+    
 end
 
 fprintf('  Consensus ranking complete\n\n');
@@ -939,35 +1042,39 @@ if isfield(consensusRanking, 'valueAtPowerOn')
     
     sortIdx = consensusRanking.valueAtPowerOn.sortedIndices(1:min(15, length(sortIdx)));
     
-    fprintf('%-60s %8s %8s %8s %8s %8s\n', ...
+    fprintf('%-60s %8s %8s %8s %8s %10s\n', ...
             'External Feature', 'Pearson', 'RF Imp', 'MI', 'Partial', 'Avg Rank');
-    fprintf('%s\n', repmat('-', 1, 120));
+    fprintf('%s\n', repmat('-', 1, 104));
     
     for i = 1:length(sortIdx)
         idx = sortIdx(i);
         featName = externalFeatureNames{idx};
         
         % Get values from each method
-        pearsonCorr = 0;
-        if isfield(correlationResults.valueAtPowerOn, 'Pearson')
+        pearsonCorr = NaN;
+        if isfield(correlationResults, 'valueAtPowerOn') && isfield(correlationResults.valueAtPowerOn, 'Pearson')
             pearsonCorr = correlationResults.valueAtPowerOn.Pearson.correlations(idx);
         end
         
-        rfImp = 0;
+        RFimp = NaN;
         if isfield(rfResults, 'valueAtPowerOn')
             rfFeats = rfResults.valueAtPowerOn.featureNames;
             rfIdx = find(strcmp(rfFeats, featName), 1);
             if ~isempty(rfIdx)
-                rfImp = rfResults.valueAtPowerOn.importance(rfIdx);
+                impRaw = rfResults.valueAtPowerOn.importance(rfIdx);
+                impMax = max(rfResults.valueAtPowerOn.importance);
+                if impMax > 0
+                    RFimp = impRaw / impMax; % Normalize for display
+                end
             end
         end
         
-        miScore = 0;
+        miScore = NaN;
         if isfield(miResults, 'valueAtPowerOn')
             miScore = miResults.valueAtPowerOn.scores(idx);
         end
         
-        partialCorr = 0;
+        partialCorr = NaN;
         if isfield(partialCorrResults, 'valueAtPowerOn')
             pcFeats = partialCorrResults.valueAtPowerOn.featureNames;
             pcIdx = find(strcmp(pcFeats, featName), 1);
@@ -978,8 +1085,8 @@ if isfield(consensusRanking, 'valueAtPowerOn')
         
         avgRank = consensusRanking.valueAtPowerOn.avgRank(idx);
         
-        fprintf('%-60s %+7.3f %8.3f %7.3f %+7.3f %8.1f\n', ...
-                truncateString(featName, 60), pearsonCorr, rfImp, miScore, partialCorr, avgRank);
+        fprintf('%-60s %+7.3f %8.3f %7.3f %+7.3f %10.1f\n', ...
+                truncateString(featName, 60), pearsonCorr, RFimp, miScore, partialCorr, avgRank);
     end
     fprintf('\n');
 end
@@ -1010,10 +1117,12 @@ end
 % Display key statistics
 fprintf('=== DATASET STATISTICS ===\n');
 fprintf('Total events analyzed: %d\n', numEvents);
-fprintf('Clean start events: %d\n', sum(~[events.isCascade]));
-fprintf('Cascade events: %d\n', sum([events.isCascade]));
-fprintf('Events flagged as outliers: %d (%.1f%%)\n', numOutlierEvents, 100*numOutlierEvents/numEvents);
-fprintf('Average off duration: %.2f ± %.2f seconds\n', mean([events.offDuration]), std([events.offDuration]));
+if numEvents > 0
+    fprintf('Clean start events: %d\n', sum(~[events.isCascade]));
+    fprintf('Cascade events: %d\n', sum([events.isCascade]));
+    fprintf('Events flagged as outliers: %d (%.1f%%)\n', numOutlierEvents, 100*numOutlierEvents/numEvents);
+    fprintf('Average off duration: %.2f ± %.2f seconds\n', mean([events.offDuration]), std([events.offDuration]));
+end
 fprintf('\n');
 
 %% ========================================================================
@@ -1028,7 +1137,7 @@ set(0, 'DefaultAxesFontName', 'Arial');
 set(0, 'DefaultTextInterpreter', 'none');
 
 %% Figure 1: Method Comparison Heatmap
-fig1 = figure('Name', 'Method Comparison', 'Position', [100 100 1400 800]);
+fig1 = figure('Name', 'Method Comparison', 'Position', [100 100 1400 800], 'Visible', 'off');
 
 subplot(2,2,1)
 if isfield(correlationResults, 'valueAtPowerOn') && isfield(correlationResults.valueAtPowerOn, 'Pearson')
@@ -1038,7 +1147,7 @@ end
 
 subplot(2,2,2)
 if isfield(rfResults, 'valueAtPowerOn')
-    importance = zeros(length(externalFeatureNames), 1);
+    importance = nan(length(externalFeatureNames), 1);
     featureNamesRF = rfResults.valueAtPowerOn.featureNames;
     for f = 1:length(featureNamesRF)
         idx = find(strcmp(externalFeatureNames, featureNamesRF{f}), 1);
@@ -1058,7 +1167,7 @@ end
 
 subplot(2,2,4)
 if isfield(partialCorrResults, 'valueAtPowerOn')
-    partialCorr = zeros(length(externalFeatureNames), 1);
+    partialCorr = nan(length(externalFeatureNames), 1);
     featureNamesPC = partialCorrResults.valueAtPowerOn.featureNames;
     for f = 1:length(featureNamesPC)
         idx = find(strcmp(externalFeatureNames, featureNamesPC{f}), 1);
@@ -1072,7 +1181,7 @@ end
 sgtitle('Method Comparison: Value at Power-On', 'FontSize', 14, 'FontWeight', 'bold');
 
 %% Figure 2: Consensus Top Features
-fig2 = figure('Name', 'Consensus Top Features', 'Position', [150 150 1200 700]);
+fig2 = figure('Name', 'Consensus Top Features', 'Position', [150 150 1200 700], 'Visible', 'off');
 
 if isfield(consensusRanking, 'valueAtPowerOn')
     sortIdx = consensusRanking.valueAtPowerOn.sortedIndices(1:min(20, length(sortIdx)));
@@ -1081,7 +1190,7 @@ if isfield(consensusRanking, 'valueAtPowerOn')
     
     barh(topRanks);
     set(gca, 'YTick', 1:length(topRanks), 'YTickLabel', cleanFeatureNames(topNames));
-    xlabel('Average Rank Across Methods', 'FontSize', 12);
+    xlabel('Average Rank Across Methods (Lower is Better)', 'FontSize', 12);
     ylabel('External Feature', 'FontSize', 12);
     title('Top 20 Features by Consensus Ranking', 'FontSize', 14, 'FontWeight', 'bold');
     grid on;
@@ -1089,7 +1198,7 @@ if isfield(consensusRanking, 'valueAtPowerOn')
 end
 
 %% Figure 3: Scatter Plots of Top Correlations
-fig3 = figure('Name', 'Top Correlations Scatter', 'Position', [200 200 1600 900]);
+fig3 = figure('Name', 'Top Correlations Scatter', 'Position', [200 200 1600 900], 'Visible', 'off');
 
 if isfield(consensusRanking, 'valueAtPowerOn')
     sortIdx = consensusRanking.valueAtPowerOn.sortedIndices(1:min(9, length(sortIdx)));
@@ -1103,34 +1212,38 @@ if isfield(consensusRanking, 'valueAtPowerOn')
         
         validIdx = isfinite(responseData) & isfinite(externalData) & ~outlierEventMask;
         
-        scatter(externalData(validIdx), responseData(validIdx), 50, 'filled', ...
-               'MarkerFaceAlpha', 0.5, 'MarkerEdgeColor', 'none');
-        
-        % Add regression line
-        p = polyfit(externalData(validIdx), responseData(validIdx), 1);
-        xFit = linspace(min(externalData(validIdx)), max(externalData(validIdx)), 100);
-        yFit = polyval(p, xFit);
-        hold on;
-        plot(xFit, yFit, 'r-', 'LineWidth', 2);
-        
-        xlabel(cleanFeatureName(externalFeatureNames{idx}), 'FontSize', 10);
-        ylabel('Response at Power-On', 'FontSize', 10);
-        
-        % Add correlation coefficient
-        if isfield(correlationResults.valueAtPowerOn, 'Pearson')
-            r = correlationResults.valueAtPowerOn.Pearson.correlations(idx);
-            p_val = correlationResults.valueAtPowerOn.Pearson.pValues(idx);
-            title(sprintf('r=%.3f, p=%.4f', r, p_val), 'FontSize', 10);
+        if sum(validIdx) > 10
+            scatter(externalData(validIdx), responseData(validIdx), 50, 'filled', ...
+                   'MarkerFaceAlpha', 0.5, 'MarkerEdgeColor', 'none');
+
+            % Add regression line
+            p = polyfit(externalData(validIdx), responseData(validIdx), 1);
+            xFit = linspace(min(externalData(validIdx)), max(externalData(validIdx)), 100);
+            yFit = polyval(p, xFit);
+            hold on;
+            plot(xFit, yFit, 'r-', 'LineWidth', 2);
+
+            xlabel(cleanFeatureName(externalFeatureNames{idx}), 'FontSize', 10);
+            ylabel('Response at Power-On', 'FontSize', 10);
+
+            % Add correlation coefficient
+            if isfield(correlationResults, 'valueAtPowerOn') && isfield(correlationResults.valueAtPowerOn, 'Pearson')
+                r = correlationResults.valueAtPowerOn.Pearson.correlations(idx);
+                p_val = correlationResults.valueAtPowerOn.Pearson.pValues(idx);
+                title(sprintf('r=%.3f, p=%.4f', r, p_val), 'FontSize', 10);
+            end
+
+            grid on;
+        else
+            title(sprintf('%s (Insufficient Data)', cleanFeatureName(externalFeatureNames{idx})), 'FontSize', 10);
         end
-        
-        grid on;
     end
 end
 
 sgtitle('Top Feature Correlations with Response at Power-On', 'FontSize', 14, 'FontWeight', 'bold');
 
 %% Figure 4: Response Dynamics by Event Type
-fig4 = figure('Name', 'Event Type Comparison', 'Position', [250 250 1400 600]);
+fig4 = figure('Name', 'Event Type Comparison', 'Position', [250 250 1400 600], 'Visible', 'off');
 
 subplot(1,2,1)
 cleanEvents = responseFeatures.valueAtPowerOn(~[events.isCascade] & ~outlierEventMask');
@@ -1143,11 +1256,13 @@ if ~isempty(cleanEvents) && ~isempty(cascadeEvents)
     ylabel('Response Value at Power-On', 'FontSize', 12);
     title('Response Comparison by Event Type', 'FontSize', 12, 'FontWeight', 'bold');
     grid on;
+else
+    title('Response Comparison (Insufficient Data)', 'FontSize', 12);
 end
 
 subplot(1,2,2)
-cleanSettling = responseFeatures.settlingTime2pct(~[events.isCascade] & ~outlierEventMask');
-cascadeSettling = responseFeatures.settlingTime2pct([events.isCascade] & ~outlierEventMask');
+cleanSettling = responseFeatures.settlingTime2pct(~[events.isCascade] & ~outlierEventMask' & isfinite(responseFeatures.settlingTime2pct));
+cascadeSettling = responseFeatures.settlingTime2pct([events.isCascade] & ~outlierEventMask' & isfinite(responseFeatures.settlingTime2pct));
 
 if ~isempty(cleanSettling) && ~isempty(cascadeSettling)
     boxplot([cleanSettling; cascadeSettling], ...
@@ -1156,20 +1271,24 @@ if ~isempty(cleanSettling) && ~isempty(cascadeSettling)
     ylabel('Settling Time (2%) [s]', 'FontSize', 12);
     title('Settling Time by Event Type', 'FontSize', 12, 'FontWeight', 'bold');
     grid on;
+else
+    title('Settling Time (Insufficient Data)', 'FontSize', 12);
 end
 
 %% Figure 5: Time Series Overview with Events
-fig5 = figure('Name', 'Time Series Overview', 'Position', [300 300 1600 800]);
+fig5 = figure('Name', 'Time Series Overview', 'Position', [300 300 1600 800], 'Visible', 'off');
 
 subplot(3,1,1)
 plot(data.time, data.response, 'b-', 'LineWidth', 1);
 hold on;
-eventTimes = [events.time];
-plot(eventTimes, zeros(size(eventTimes)), 'ro', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
+if numEvents > 0
+    eventTimes = [events.time];
+    plot(eventTimes, zeros(size(eventTimes)), 'ro', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
+    legend({'Response', 'Power-On Events'}, 'Location', 'best');
+end
 ylabel('Response Signal', 'FontSize', 11);
 title('System Response with Power-On Events', 'FontSize', 12, 'FontWeight', 'bold');
 grid on;
-legend({'Response', 'Power-On Events'}, 'Location', 'best');
 
 subplot(3,1,2)
 plot(data.time, data.powerOn, 'k-', 'LineWidth', 1.5);
@@ -1189,7 +1308,7 @@ if numExternal > 0
 end
 
 %% Figure 6: Feature Importance Comparison Across Metrics
-fig6 = figure('Name', 'Feature Importance Across Metrics', 'Position', [350 350 1400 800]);
+fig6 = figure('Name', 'Feature Importance Across Metrics', 'Position', [350 350 1400 800], 'Visible', 'off');
 
 if isfield(rfResults, 'valueAtPowerOn') && isfield(rfResults, 'settlingTime2pct')
     % Get top features from each metric
@@ -1212,7 +1331,7 @@ if isfield(rfResults, 'valueAtPowerOn') && isfield(rfResults, 'settlingTime2pct'
         subplot(1,2,1)
         barh(impValue);
         set(gca, 'YTick', 1:length(impValue), 'YTickLabel', cleanFeatureNames(featsValue));
-        xlabel('RF Importance', 'FontSize', 11);
+        xlabel('RF Importance (OOB Permuted Error)', 'FontSize', 11);
         title('Value at Power-On', 'FontSize', 12, 'FontWeight', 'bold');
         grid on;
         set(gca, 'YDir', 'reverse');
@@ -1220,8 +1339,8 @@ if isfield(rfResults, 'valueAtPowerOn') && isfield(rfResults, 'settlingTime2pct'
         subplot(1,2,2)
         barh(impSettling);
         set(gca, 'YTick', 1:length(impSettling), 'YTickLabel', cleanFeatureNames(featsSettling));
-        xlabel('RF Importance', 'FontSize', 11);
-        title('Settling Time', 'FontSize', 12, 'FontWeight', 'bold');
+        xlabel('RF Importance (OOB Permuted Error)', 'FontSize', 11);
+        title('Settling Time (2%)', 'FontSize', 12, 'FontWeight', 'bold');
         grid on;
         set(gca, 'YDir', 'reverse');
     end
@@ -1241,9 +1360,11 @@ fprintf('Step 13: Exporting results...\n');
 results = struct();
 results.metadata = struct();
 results.metadata.numEvents = numEvents;
-results.metadata.numCleanEvents = sum(~[events.isCascade]);
-results.metadata.numCascadeEvents = sum([events.isCascade]);
-results.metadata.numOutlierEvents = numOutlierEvents;
+if numEvents > 0
+    results.metadata.numCleanEvents = sum(~[events.isCascade]);
+    results.metadata.numCascadeEvents = sum([events.isCascade]);
+    results.metadata.numOutlierEvents = numOutlierEvents;
+end
 results.metadata.analysisDate = datestr(now);
 results.metadata.params = params;
 
@@ -1259,23 +1380,23 @@ results.consensusRanking = consensusRanking;
 results.outlierEventMask = outlierEventMask;
 
 % Save to MAT file
-save('publication_grade_analysis_results.mat', 'results', '-v7.3');
-fprintf('  Results saved to: publication_grade_analysis_results.mat\n');
+save('publication_grade_analysis_results_v2.mat', 'results', '-v7.3');
+fprintf('  Results saved to: publication_grade_analysis_results_v2.mat\n');
 
 % Export summary table to CSV
 if isfield(consensusRanking, 'valueAtPowerOn')
     exportSummaryTable(consensusRanking.valueAtPowerOn, correlationResults.valueAtPowerOn, ...
                       rfResults, miResults, partialCorrResults, externalFeatureNames);
-    fprintf('  Summary table exported to: feature_importance_summary.csv\n');
+    fprintf('  Summary table exported to: feature_importance_summary_v2.csv\n');
 end
 
 % Save figures
-saveas(fig1, 'fig1_method_comparison.png');
-saveas(fig2, 'fig2_consensus_ranking.png');
-saveas(fig3, 'fig3_scatter_plots.png');
-saveas(fig4, 'fig4_event_types.png');
-saveas(fig5, 'fig5_time_series_overview.png');
-saveas(fig6, 'fig6_importance_comparison.png');
+saveas(fig1, 'fig1_method_comparison_v2.png');
+saveas(fig2, 'fig2_consensus_ranking_v2.png');
+saveas(fig3, 'fig3_scatter_plots_v2.png');
+saveas(fig4, 'fig4_event_types_v2.png');
+saveas(fig5, 'fig5_time_series_overview_v2.png');
+saveas(fig6, 'fig6_importance_comparison_v2.png');
 fprintf('  Figures saved as PNG files\n\n');
 
 fprintf('========================================\n');
@@ -1286,7 +1407,7 @@ fprintf('Key Findings Summary:\n');
 fprintf('--------------------\n');
 if isfield(consensusRanking, 'valueAtPowerOn')
     sortIdx = consensusRanking.valueAtPowerOn.sortedIndices(1:min(5, length(sortIdx)));
-    fprintf('Top 5 most influential external signals:\n');
+    fprintf('Top 5 most influential external signals (lower rank is better):\n');
     for i = 1:length(sortIdx)
         idx = sortIdx(i);
         fprintf('  %d. %s (avg rank: %.1f)\n', i, ...
@@ -1294,23 +1415,31 @@ if isfield(consensusRanking, 'valueAtPowerOn')
     end
 end
 
+% Close invisible figures
+close(fig1);
+close(fig2);
+close(fig3);
+close(fig4);
+close(fig5);
+close(fig6);
+
+end % --- THIS ENDS THE MAIN FUNCTION ---
+
 %% ========================================================================
-%  HELPER FUNCTIONS
+%  HELPER FUNCTIONS (Now correctly scoped as local functions)
 %  ========================================================================
-
-    function initializeResponseFeature(name)
-        responseFeatures.(name) = zeros(numEvents, 1);
-        featureNames{end+1} = name;
-    end
-
-    function initializeExternalFeature(name)
-        externalFeatures.(name) = zeros(numEvents, 1);
-    end
 
     function plotMethodHeatmap(values, names, titleStr)
         % Plot top 30 features
-        [sortedVals, sortIdx] = sort(abs(values), 'descend');
-        topN = min(30, length(sortIdx));
+        [sortedVals, sortIdx] = sort(abs(values), 'descend', 'MissingPlacement', 'last');
+        topN = min(30, sum(isfinite(sortedVals)));
+        
+        if topN == 0
+            title(titleStr, 'FontSize', 11, 'FontWeight', 'bold');
+            text(0.5, 0.5, 'No Data', 'HorizontalAlignment', 'center', 'FontSize', 12);
+            axis off;
+            return;
+        end
         
         imagesc(sortedVals(1:topN)');
         colormap(gca, parula);
@@ -1344,8 +1473,8 @@ end
     function exportSummaryTable(consensus, corrRes, rfRes, miRes, pcRes, featNames)
         sortIdx = consensus.sortedIndices(1:min(50, length(consensus.sortedIndices)));
         
-        fid = fopen('feature_importance_summary.csv', 'w');
-        fprintf(fid, 'Rank,Feature,AvgRank,Pearson,Pearson_p,RF_Importance,MI_Score,PartialCorr,PartialCorr_p\n');
+        fid = fopen('feature_importance_summary_v2.csv', 'w');
+        fprintf(fid, 'Rank,Feature,AvgRank,Pearson,Pearson_p_adj,RF_Importance_Norm,MI_Score,PartialCorr,PartialCorr_p\n');
         
         for i = 1:length(sortIdx)
             idx = sortIdx(i);
@@ -1353,29 +1482,33 @@ end
             avgRank = consensus.avgRank(idx);
             
             % Get values from each method
-            pearsonCorr = 0;
-            pearsonP = 1;
+            pearsonCorr = NaN;
+            pearsonP = NaN;
             if isfield(corrRes, 'Pearson')
                 pearsonCorr = corrRes.Pearson.correlations(idx);
                 pearsonP = corrRes.Pearson.pValues_adjusted(idx);
             end
             
-            rfImp = 0;
+            RFimp = NaN;
             if ~isempty(rfRes) && isfield(rfRes, 'valueAtPowerOn')
                 rfFeats = rfRes.valueAtPowerOn.featureNames;
                 rfIdx = find(strcmp(rfFeats, featName), 1);
                 if ~isempty(rfIdx)
-                    rfImp = rfRes.valueAtPowerOn.importance(rfIdx);
+                    impRaw = rfRes.valueAtPowerOn.importance(rfIdx);
+                    impMax = max(rfRes.valueAtPowerOn.importance);
+                    if impMax > 0
+                        RFimp = impRaw / impMax;
+                    end
                 end
             end
             
-            miScore = 0;
+            miScore = NaN;
             if ~isempty(miRes) && isfield(miRes, 'valueAtPowerOn')
                 miScore = miRes.valueAtPowerOn.scores(idx);
             end
             
-            partialCorr = 0;
-            partialP = 1;
+            partialCorr = NaN;
+            partialP = NaN;
             if ~isempty(pcRes) && isfield(pcRes, 'valueAtPowerOn')
                 pcFeats = pcRes.valueAtPowerOn.featureNames;
                 pcIdx = find(strcmp(pcFeats, featName), 1);
@@ -1386,7 +1519,7 @@ end
             end
             
             fprintf(fid, '%d,%s,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n', ...
-                    i, featName, avgRank, pearsonCorr, pearsonP, rfImp, miScore, ...
+                    i, featName, avgRank, pearsonCorr, pearsonP, RFimp, miScore, ...
                     partialCorr, partialP);
         end
         
@@ -1397,20 +1530,25 @@ end
         % Calculate mutual information for discrete variables
         % MI(X;Y) = H(X) + H(Y) - H(X,Y)
         
+        n = length(x);
+        
         % Joint probability
-        pxy = accumarray([x(:), y(:)], 1) / length(x);
-        pxy = pxy(pxy > 0); % Remove zeros for log calculation
+        % Use sparse matrix for efficiency
+        pxy = sparse(x, y, 1, max(x), max(y));
+        pxy = pxy / n;
+        pxy_flat = pxy(pxy > 0);
         
         % Marginal probabilities
-        px = accumarray(x(:), 1) / length(x);
+        px = sum(pxy, 2);
+        py = sum(pxy, 1);
+        
         px = px(px > 0);
-        py = accumarray(y(:), 1) / length(y);
         py = py(py > 0);
         
         % Entropies
         hx = -sum(px .* log2(px));
         hy = -sum(py .* log2(py));
-        hxy = -sum(pxy .* log2(pxy));
+        hxy = -sum(pxy_flat .* log2(pxy_flat));
         
         % Mutual information
         mi = hx + hy - hxy;
@@ -1420,13 +1558,14 @@ end
         % Simple Granger causality test
         % Tests if x Granger-causes y
         
-        n = length(y);
+        n_obs = length(y);
+        n_reg = n_obs - maxLag; % Number of samples for regression
         
         % Unrestricted model: y regressed on lagged y and lagged x
-        X_unrestricted = zeros(n - maxLag, 2 * maxLag);
+        X_unrestricted = zeros(n_reg, 2 * maxLag);
         for lag = 1:maxLag
-            X_unrestricted(:, lag) = y(maxLag - lag + 1:n - lag);
-            X_unrestricted(:, maxLag + lag) = x(maxLag - lag + 1:n - lag);
+            X_unrestricted(:, lag) = y(maxLag - lag + 1:n_obs - lag);
+            X_unrestricted(:, maxLag + lag) = x(maxLag - lag + 1:n_obs - lag);
         end
         y_target = y(maxLag + 1:end);
         
@@ -1442,38 +1581,68 @@ end
         rss_restricted = sum((y_target - X_restricted * beta_restricted).^2);
         
         % F-statistic
-        p = maxLag;
-        q = maxLag;
-        fStat = ((rss_restricted - rss_unrestricted) / q) / (rss_unrestricted / (n - maxLag - 2*maxLag));
+        p_restricted = maxLag;
+        p_unrestricted = 2 * maxLag;
+        
+        fStat = ((rss_restricted - rss_unrestricted) / (p_unrestricted - p_restricted)) / ...
+                (rss_unrestricted / (n_reg - p_unrestricted));
         
         % P-value from F-distribution
-        pValue = 1 - fcdf(fStat, q, n - maxLag - 2*maxLag);
+        df1 = p_unrestricted - p_restricted;
+        df2 = n_reg - p_unrestricted;
+        pValue = 1 - fcdf(fStat, df1, df2);
     end
 
-    function [h, crit_p, adj_p] = fdr_bh(pvals, q)
-        % False Discovery Rate correction (Benjamini-Hochberg)
-        % Returns adjusted p-values
+    function [h, crit_p, adj_ci, adj_p] = fdr_bh(pvals, q)
+        % fdr_bh: False Discovery Rate correction (Benjamini-Hochberg)
+        %
+        % Usage:
+        % [h, crit_p, adj_ci, adj_p] = fdr_bh(pvals, q)
+        %
+        % Inputs:
+        %   pvals       - Vector of p-values
+        %   q           - False discovery rate level (e.g., 0.05)
+        %
+        % Outputs:
+        %   h           - Vector of booleans (1=reject H0, 0=do not reject)
+        %   crit_p      - The p-value threshold for significance
+        %   adj_ci      - Adjusted critical p-value (not really used, legacy)
+        %   adj_p       - Vector of FDR-adjusted p-values
+        
+        pvals = pvals(:);
+        nanPvals = isnan(pvals);
+        pvals(nanPvals) = 1; % Set NaNs to 1 so they don't affect sorting
         
         m = length(pvals);
         [sorted_p, sort_idx] = sort(pvals);
         
-        % Find largest i such that P(i) <= (i/m)*q
-        crit_p = zeros(size(pvals));
-        adj_p = zeros(size(pvals));
+        % Calculate adjusted p-values
+        adj_p = m * sorted_p ./ (1:m)';
         
-        for i = 1:m
-            crit_p(i) = (i/m) * q;
+        % Enforce monotonicity (make sure they are non-decreasing)
+        for i = (m-1):-1:1
+            adj_p(i) = min(adj_p(i), adj_p(i+1));
         end
         
-        % Adjusted p-values
-        adj_p(sort_idx) = min(1, m * sorted_p ./ (1:m)');
+        % "Unsort" adjusted p-values
+        adj_p_unsorted = zeros(m,1);
+        adj_p_unsorted(sort_idx) = adj_p;
+        adj_p = adj_p_unsorted;
         
-        % Enforce monotonicity
-        for i = m-1:-1:1
-            adj_p(sort_idx(i)) = min(adj_p(sort_idx(i)), adj_p(sort_idx(i+1)));
+        % Find the largest p-value that is significant
+        significant_p = sorted_p(sorted_p <= (1:m)'/m * q);
+        if isempty(significant_p)
+            crit_p = 0;
+        else
+            crit_p = max(significant_p);
         end
         
         h = adj_p <= q;
+        adj_ci = crit_p; % for compatibility
+        
+        % Restore NaNs
+        adj_p(nanPvals) = NaN;
+        h(nanPvals) = NaN;
     end
 
     function data = generateSyntheticData()
@@ -1481,63 +1650,65 @@ end
         fprintf('Generating synthetic data...\n');
         
         dt = 0.01;
-        t = 0:dt:2000; % 2000 seconds
+        t = (0:dt:2000)'; % 2000 seconds
         n = length(t);
         
         % Power-on signal with realistic outages
         powerOn = true(n, 1);
         numOutages = 30;
         for i = 1:numOutages
-            outageStart = randi([500, n-500]);
-            outageDuration = randi([100, 500]); % 1-5 seconds
+            outageStart = randi([500, n-5000]);
+            outageDuration = randi([round(2/dt), round(10/dt)]); % 2-10 seconds
             powerOn(outageStart:min(outageStart+outageDuration, n)) = false;
         end
         
         % Response signal with realistic dynamics
         response = zeros(n, 1);
-        controlGain = 2.0;
+        controlGain = 0.5;
         tau = 3.0; % Time constant
         
         % External signals with different characteristics
         external = struct();
-        external.temperature = 25 + 8*sin(2*pi*t/400) + 2*randn(size(t));
-        external.pressure = 101.3 + 5*cos(2*pi*t/300) + randn(size(t));
-        external.flow = 50 + 20*sin(2*pi*t/500) + 5*sin(2*pi*t/50) + 3*randn(size(t));
-        external.vibration = 0.1*randn(size(t));
-        external.humidity = 60 + 10*sin(2*pi*t/600) + 3*randn(size(t));
+        
+        % Signal A: Will cause drift during off-time
+        external.sig_A_drift = 5 + 3 * smoothdata(randn(n,1), 'gaussian', 500);
+        
+        % Signal B: Will affect recovery time constant
+        external.sig_B_dynamics = 1 + 0.5 * smoothdata(randn(n,1), 'gaussian', 1000);
+        
+        % Signal C: Distractor
+        external.sig_C_distractor = smoothdata(randn(n,1), 'gaussian', 100);
+        
+        % Signal F (NEW): Will cause non-zero settling
+        external.sig_F_settling = 0.5 * smoothdata(randn(n,1), 'gaussian', 800);
         
         % Simulate response with realistic control dynamics
         for i = 2:n
             if powerOn(i)
-                % Control loop active - exponential decay with disturbances
-                disturbance = 0.02*external.temperature(i) + ...
-                             0.01*external.pressure(i) + ...
-                             0.03*external.flow(i) + ...
-                             0.5*external.vibration(i) + ...
-                             0.005*external.humidity(i);
+                % Control loop active - exponential decay
+                % Dynamic tau based on Signal B
+                current_tau = tau / external.sig_B_dynamics(i);
                 
-                % First-order system dynamics
-                response(i) = response(i-1) * (1 - dt/tau) + ...
-                             (-controlGain * response(i-1) + disturbance) * dt;
+                % Disturbance from signal C
+                disturbance = 0.01 * external.sig_C_distractor(i);
+                
+                % Non-zero setpoint from Signal F
+                setpoint = external.sig_F_settling(i);
+                
+                % First-order system dynamics (decaying to setpoint)
+                response(i) = response(i-1) * (1 - dt/current_tau) + ...
+                             (setpoint/current_tau + disturbance) * dt;
             else
-                % Control loop inactive - drift based on external signals
-                drift = 0.05*external.temperature(i) + ...
-                       0.02*external.pressure(i) + ...
-                       0.04*external.flow(i) + ...
-                       0.01*external.humidity(i);
-                response(i) = response(i-1) + drift*dt + 1.0*randn*dt;
+                % Control loop inactive - drift based on external signal A
+                drift = 0.1 * external.sig_A_drift(i);
+                response(i) = response(i-1) + drift*dt + 0.01*randn;
             end
-            
-            % Add some nonlinearity
-            response(i) = response(i) + 0.001 * response(i)^2 * sign(response(i));
         end
         
-        data.time = t';
-        data.response = response;
+        data.time = t;
+        data.response = response + 0.01*randn(n,1); % Add measurement noise
         data.powerOn = powerOn;
         data.external = external;
         
         fprintf('Synthetic data generated (n=%d samples, %.1f sec duration)\n\n', n, t(end));
     end
-
-end
